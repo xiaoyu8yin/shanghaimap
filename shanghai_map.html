@@ -1,0 +1,295 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>上海市行政区划交互地图 · 街道/镇级</title>
+<script src="https://cdn.jsdelivr.net/npm/echarts@5.5.0/dist/echarts.min.js"></script>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  body { font-family:"PingFang SC","Microsoft YaHei",sans-serif; background:#0b1220; color:#e2e8f0; height:100vh; display:flex; flex-direction:column; overflow:hidden; }
+  header { padding:12px 20px; background:#111a2e; border-bottom:1px solid #1e293b; display:flex; align-items:center; gap:12px; flex-wrap:wrap; }
+  header h1 { font-size:17px; font-weight:600; color:#f1f5f9; white-space:nowrap; }
+  header h1 small { font-size:12px; color:#64748b; font-weight:400; margin-left:8px; }
+  .crumb { display:flex; align-items:center; gap:6px; font-size:13px; color:#94a3b8; }
+  .crumb b { color:#38bdf8; cursor:pointer; font-weight:500; }
+  .crumb b:hover { text-decoration:underline; }
+  .spacer { flex:1; }
+  .search { position:relative; }
+  .search input { width:200px; padding:6px 10px; border-radius:6px; border:1px solid #334155; background:#0f172a; color:#e2e8f0; font-size:13px; outline:none; }
+  .search input:focus { border-color:#38bdf8; }
+  .slist { position:absolute; top:36px; left:0; width:220px; max-height:260px; overflow:auto; background:#1e293b; border:1px solid #334155; border-radius:6px; z-index:99; display:none; box-shadow:0 8px 24px rgba(0,0,0,.5); }
+  .slist div { padding:7px 12px; font-size:13px; cursor:pointer; }
+  .slist div:hover { background:#334155; }
+  .slist div span { color:#64748b; font-size:11px; margin-left:6px; }
+  .btn { padding:6px 14px; border-radius:6px; border:1px solid #334155; background:#1e293b; color:#cbd5e1; font-size:13px; cursor:pointer; }
+  .btn:hover { border-color:#38bdf8; color:#38bdf8; }
+  .btn.primary { background:#0ea5e9; border-color:#0ea5e9; color:#fff; }
+  .btn.primary:hover { background:#38bdf8; }
+  #status { padding:5px 20px; font-size:12px; color:#64748b; background:#0d1526; border-bottom:1px solid #16213a; min-height:26px; }
+  #status .err { color:#f87171; }
+  #map { flex:1; }
+</style>
+</head>
+<body>
+<header>
+  <h1>上海市行政区划地图<small>细化到街道 / 镇</small></h1>
+  <div class="crumb" id="crumb"></div>
+  <div class="spacer"></div>
+  <div class="search">
+    <input id="kw" placeholder="搜索当前层名称…" autocomplete="off">
+    <div class="slist" id="slist"></div>
+  </div>
+  <button class="btn primary" id="btnAll">全市街道镇总览</button>
+  <button class="btn" id="btnReset">重置</button>
+</header>
+<div id="status">正在加载上海市数据…</div>
+<div id="map"></div>
+
+<script>
+/* ============================================================
+ * 数据源：本地“上海市区geojson地图文件”数据，在线接口作为兜底
+ * API: https://geojson.hxkj.vip/api/geojson/children?parentCode={adcode}
+ * 说明：阿里云 DataV 仅提供到区县级；街道/镇级由此接口实时获取。
+ * 离线用法：从 https://geojson.hxkj.vip/ 下载“上海市”乡镇级 GeoJSON 后，
+ *           将其内容粘贴到 LOCAL_GEOJSON 变量即可断网使用。
+ * ============================================================ */
+const API = 'https://geojson.hxkj.vip/api/geojson/children?parentCode=';
+const CITY_FALLBACK_API = 'https://geo.datav.aliyun.com/areas_v3/bound/310000_full.json';
+const LOCAL_GEOJSON = null; // ← 离线模式：把下载的全市乡镇 GeoJSON 对象粘贴到这里
+const LOCAL_DATA_BASE = '上海市区geojson地图文件/';
+const LOCAL_DISTRICT_FILES = {
+  '310101': '黄浦区', '310104': '徐汇区', '310105': '长宁区', '310106': '静安区',
+  '310107': '普陀区', '310109': '虹口区', '310110': '杨浦区', '310112': '闵行区',
+  '310113': '宝山区', '310114': '嘉定区', '310115': '浦东新区', '310116': '金山区',
+  '310117': '松江区', '310118': '青浦区', '310120': '奉贤区', '310151': '崇明区'
+};
+
+const chart = echarts.init(document.getElementById('map'), null, { renderer: 'canvas' });
+const statusEl = document.getElementById('status');
+const crumbEl = document.getElementById('crumb');
+
+let stack = [{ name: '上海市', adcode: '310000' }];   // 下钻栈
+let current = { gj: null, mapName: '310000', level: 'city', townView: false };
+const DISTRICTS = ['310101','310104','310105','310106','310107','310109','310110',
+                   '310112','310113','310114','310115','310116','310117','310118','310120','310151'];
+const DISTRICT_NAMES = {310101:'黄浦区',310104:'徐汇区',310105:'长宁区',310106:'静安区',310107:'普陀区',
+  310109:'虹口区',310110:'杨浦区',310112:'闵行区',310113:'宝山区',310114:'嘉定区',310115:'浦东新区',
+  310116:'金山区',310117:'松江区',310118:'青浦区',310120:'奉贤区',310151:'崇明区'};
+
+function setStatus(msg, isErr){
+  statusEl.innerHTML = isErr ? '<span class="err">⚠ ' + msg + '</span>' : msg;
+}
+function normalize(d){
+  if (!d) throw new Error('空响应');
+  if (d.type === 'FeatureCollection') return d;
+  if (d.features) return { type:'FeatureCollection', features:d.features };
+  if (d.data) return normalize(d.data);
+  if (d.geojson) return normalize(d.geojson);
+  throw new Error('无法识别的数据格式');
+}
+async function fetchChildren(code, retries = 1){
+  const localFile = String(code) === '310000'
+    ? LOCAL_DATA_BASE + '上海.json'
+    : LOCAL_DISTRICT_FILES[String(code)]
+      ? LOCAL_DATA_BASE + '上海市/' + LOCAL_DISTRICT_FILES[String(code)] + '.json'
+      : null;
+  if (localFile) {
+    try {
+      const local = await fetch(localFile);
+      if (local.ok) return normalize(await local.json());
+    } catch (e) { /* 通过在线接口继续尝试 */ }
+  }
+  if (String(code) === '310000') {
+    const fallback = await fetch(CITY_FALLBACK_API);
+    if (fallback.ok) return normalize(await fallback.json());
+  }
+  const res = await fetch(API + code);
+  if (res.ok) return normalize(await res.json());
+  throw new Error('HTTP ' + res.status + '（街道/镇级接口已失效）');
+}
+function featureBBox(f){
+  let minX=1e9,minY=1e9,maxX=-1e9,maxY=-1e9;
+  (function walk(c){
+    if (typeof c[0] === 'number'){
+      if(c[0]<minX)minX=c[0]; if(c[0]>maxX)maxX=c[0];
+      if(c[1]<minY)minY=c[1]; if(c[1]>maxY)maxY=c[1];
+    } else c.forEach(walk);
+  })(f.geometry.coordinates);
+  return { cx:(minX+maxX)/2, cy:(minY+maxY)/2, w:maxX-minX, h:maxY-minY };
+}
+
+function renderCrumb(){
+  crumbEl.innerHTML = stack.map((s,i)=>
+    (i? ' <span style="color:#475569">›</span> ':'') +
+    (i===stack.length-1 ? '<span style="color:#cbd5e1">'+s.name+'</span>'
+                        : '<b data-i="'+i+'">'+s.name+'</b>')
+  ).join('');
+  crumbEl.querySelectorAll('b').forEach(b=> b.onclick = ()=>{
+    const i = +b.dataset.i;
+    stack = stack.slice(0, i+1);
+    drill(stack[i].adcode, stack[i].name, false);
+  });
+}
+
+function render(gj, mapName, opt = {}){
+  current = { gj, mapName, townView: !!opt.townView };
+  echarts.registerMap(mapName, gj);
+  const isLeaf = opt.townView || stack[stack.length-1].adcode !== '310000';
+  chart.setOption({
+    backgroundColor: 'transparent',
+    tooltip: {
+      trigger: 'item',
+      backgroundColor:'#1e293b', borderColor:'#334155',
+      textStyle:{ color:'#e2e8f0', fontSize:13 },
+      formatter: p => {
+        const f = gj.features[p.dataIndex];
+        const ad = (f.properties && (f.properties.adcode||f.properties.code)) || '';
+        const dist = f.properties && f.properties.district;
+        return '<b>' + p.name + '</b>' +
+               (dist ? '<br>所属区：' + dist : '') +
+               (ad ? '<br>区划代码：' + ad : '') +
+               '<br><span style="color:#64748b;font-size:11px">' +
+               (isLeaf ? '点击可在搜索中定位' : '点击下钻至街道/镇') + '</span>';
+      }
+    },
+    series: [{
+      type: 'map', map: mapName, roam: true,
+      zoom: opt.zoom || 1.1, center: opt.center || null,
+      scaleLimit: { min: 0.6, max: 40 },
+      label: { show: !isLeaf, fontSize: 11, color: '#cbd5e1',
+               textShadowColor:'#0b1220', textShadowBlur: 3 },
+      emphasis: {
+        label: { show: true, color:'#fff', fontSize: 12, fontWeight: 600 },
+        itemStyle: { areaColor: '#f59e0b', shadowBlur: 18, shadowColor: 'rgba(245,158,11,.5)' }
+      },
+      select: { itemStyle: { areaColor: '#f59e0b' }, label:{color:'#fff'} },
+      itemStyle: {
+        areaColor: '#1d3557', borderColor: '#38bdf8', borderWidth: 1,
+        shadowColor: 'rgba(56,189,248,.25)', shadowBlur: 8
+      },
+      data: gj.features.map((f,i)=>({
+        name: f.properties.name, value: i,
+        itemStyle: { areaColor: opt.townView
+          ? 'rgba(14,116,144,' + (0.35 + 0.5*((i*37)%100)/100) + ')'
+          : 'rgba(29,78,216,' + (0.35 + 0.45*((i*53)%100)/100) + ')' }
+      }))
+    }]
+  }, true);
+  const n = gj.features.length;
+  setStatus('当前层级：' + stack[stack.length-1].name +
+            ' ｜ 共 ' + n + ' 个' + (isLeaf ? ' 街道/镇' : ' 区') +
+            (opt.townView ? '（全市总览）' : '') +
+            ' ｜ 滚轮缩放 · 拖拽平移 · ' + (isLeaf ? '点击区域查看信息' : '点击区域下钻'));
+  renderCrumb();
+}
+
+async function drill(adcode, name, push = true){
+  if (push) stack.push({ name, adcode });
+  setStatus('正在加载「' + name + '」的街道/镇数据…');
+  try {
+    const gj = await fetchChildren(adcode);
+    if (!gj.features || !gj.features.length){
+      stack.pop(); setStatus('「' + name + '」暂无下级边界数据', true); return;
+    }
+    gj.features.forEach(f => f.properties.district = name);
+    render(gj, adcode);
+  } catch(e){
+    stack.pop();
+    setStatus('数据加载失败：' + e.message +
+      '（可将对应层级 GeoJSON 粘贴到 LOCAL_GEOJSON，或稍后重试）', true);
+  }
+}
+
+/* 全市街道镇总览：并行拉取 16 个区的街道/镇并合并 */
+async function loadAllTowns(){
+  setStatus('正在加载全市街道/镇数据（16 个区，约 220+ 个单元）…');
+  const btn = document.getElementById('btnAll'); btn.disabled = true;
+  try {
+    let gj, feats = [];
+    if (LOCAL_GEOJSON){
+      gj = normalize(LOCAL_GEOJSON);
+    } else {
+      let done = 0;
+      const results = await Promise.all(DISTRICTS.map(async code => {
+        const r = await fetchChildren(code);
+        r.features.forEach(f => f.properties.district = DISTRICT_NAMES[code]);
+        done++; setStatus('正在加载全市街道/镇数据… ' + done + '/16 个区');
+        return r.features;
+      }));
+      results.forEach(a => feats.push(...a));
+      gj = { type:'FeatureCollection', features: feats };
+    }
+    stack = [{ name:'上海市', adcode:'310000' }, { name:'全市街道/镇', adcode:'ALL' }];
+    render(gj, 'ALL_TOWNS', { townView: true });
+  } catch(e){
+    setStatus('全市总览加载失败：' + e.message +
+      '（街道/镇级在线接口已返回 404，请使用 LOCAL_GEOJSON 离线数据）', true);
+  } finally { btn.disabled = false; }
+}
+
+/* 点击下钻 */
+chart.on('click', p => {
+  if (current.townView) return;               // 街道层无下级
+  if (stack[stack.length-1].adcode === 'ALL') return;
+  const f = current.gj.features[p.dataIndex];
+  const ad = f.properties && (f.properties.adcode || f.properties.code);
+  if (ad) drill(String(ad), p.name);
+});
+
+/* 搜索定位 */
+const kw = document.getElementById('kw'), slist = document.getElementById('slist');
+kw.addEventListener('input', () => {
+  const q = kw.value.trim();
+  if (!q || !current.gj){ slist.style.display='none'; return; }
+  const hits = current.gj.features
+    .filter(f => (f.properties.name||'').includes(q))
+    .slice(0, 30);
+  if (!hits.length){ slist.style.display='none'; return; }
+  slist.innerHTML = hits.map(f =>
+    '<div data-n="'+f.properties.name+'">' + f.properties.name +
+    (f.properties.district ? '<span>'+f.properties.district+'</span>' : '') + '</div>').join('');
+  slist.style.display = 'block';
+  slist.querySelectorAll('div').forEach(d => d.onclick = () => locate(d.dataset.n));
+});
+function locate(name){
+  slist.style.display='none'; kw.value = name;
+  const idx = current.gj.features.findIndex(f => f.properties.name === name);
+  if (idx < 0) return;
+  const bb = featureBBox(current.gj.features[idx]);
+  const span = Math.max(bb.w, bb.h);
+  const zoom = Math.min(15, Math.max(1, 0.65 / span));
+  chart.setOption({ series:[{ center:[bb.cx, bb.cy], zoom: zoom }] });
+  chart.dispatchAction({ type:'select', seriesIndex:0, name });
+  chart.dispatchAction({ type:'highlight', seriesIndex:0, name });
+  chart.dispatchAction({ type:'showTip', seriesIndex:0, name });
+}
+document.addEventListener('click', e => {
+  if (!e.target.closest('.search')) slist.style.display='none';
+});
+
+/* 控件 */
+document.getElementById('btnAll').onclick = loadAllTowns;
+document.getElementById('btnReset').onclick = () => {
+  stack = [{ name:'上海市', adcode:'310000' }];
+  kw.value='';
+  init();
+};
+window.addEventListener('resize', () => chart.resize());
+
+/* 初始化 */
+async function init(){
+  setStatus('正在加载上海市数据…');
+  try {
+    const gj = LOCAL_GEOJSON ? normalize(LOCAL_GEOJSON)
+      : await fetchChildren('310000');
+    render(gj, '310000');
+  } catch(e){
+    setStatus('初始化失败：' + e.message +
+      '。区级地图已尝试备用源；街道/镇级数据请粘贴到代码中的 LOCAL_GEOJSON 变量。', true);
+  }
+}
+init();
+</script>
+</body>
+</html>
